@@ -7,6 +7,7 @@
 module Spec.V4.Encoding (tests) where
 
 import Data.List (nub)
+import Data.List.NonEmpty qualified as NE
 import Data.Map qualified as Map
 import PlutusLedgerApi.Data.V4 qualified as DataV4
 import PlutusLedgerApi.V3 qualified as V3
@@ -16,7 +17,7 @@ import PlutusLedgerApi.V4 qualified as V4
 import PlutusTx qualified
 import PlutusTx.AssocMap qualified as AssocMap
 import PlutusTx.Blueprint.Definition
-import PlutusTx.Blueprint.Schema (Schema (..))
+import PlutusTx.Blueprint.Schema (ConstructorSchema (MkConstructorSchema), Schema (..))
 import PlutusTx.Data.AssocMap qualified as DataMap
 import PlutusTx.Data.List qualified as DataList
 import PlutusTx.Ratio qualified as Ratio
@@ -125,7 +126,7 @@ tests =
             emptyOutput = V4.TxOut unstakedAddress mempty V4.NoOutputDatum Nothing
             dataUnstakedAddress = DataV4.Address dataCredential Nothing
             dataEmptyOutput = DataV4.TxOut dataUnstakedAddress mempty DataV4.NoOutputDatum Nothing
-        assertProduct unstakedAddress [PlutusTx.toData credential, nothingData]
+        PlutusTx.toData unstakedAddress @?= V4.Constr 0 [PlutusTx.toData credential, nothingData]
         assertProduct emptyOutput [PlutusTx.toData unstakedAddress, V4.Map [], V4.Constr 0 [], nothingData]
         assertProduct
           (V4.TxInInfo reference emptyOutput)
@@ -134,6 +135,67 @@ tests =
           @?= PlutusTx.toData (V4.TxInInfo reference emptyOutput)
         PlutusTx.toData (V4.SpendingScript reference Nothing)
           @?= V4.Constr 1 [V4.List referenceFields, nothingData]
+    , testCase "protected selection helper retains authored indexes" $ do
+        let protected = output {V4.txOutAddress = V4.AddressProtected (V4.ScriptCredential scriptHash) Nothing}
+            ordinary = output {V4.txOutAddress = V4.Address (V4.ScriptCredential scriptHash) Nothing}
+            other =
+              output {V4.txOutAddress = V4.AddressProtected (V4.ScriptCredential (V4.ScriptHash "other")) Nothing}
+            info = txInfo {V4.txInfoOutputs = [ordinary, protected, other, protected]}
+            backed = PlutusTx.unsafeFromBuiltinData @DataV4.TxInfo (PlutusTx.toBuiltinData info)
+        map fst (V4.protectedOutputsAt scriptHash info) @?= [1, 3]
+        map fst (DataV4.protectedOutputsAt scriptHash backed) @?= [1, 3]
+    , encodingTest
+        "protected address"
+        (V4.AddressProtected credential (Just account))
+        (DataV4.AddressProtected dataCredential (Just dataAccount))
+        (V4.Constr 1 [credentialData, justData credentialData])
+    , encodingTest
+        "receiving purpose"
+        (V4.Receiving scriptHash 3)
+        (DataV4.Receiving scriptHash 3)
+        (V4.Constr 7 [scriptHashData, V4.I 3])
+    , encodingTest
+        "receiving script info"
+        (V4.ReceivingScript 3 output)
+        (DataV4.ReceivingScript 3 dataOutput)
+        (V4.Constr 7 [V4.I 3, outputData])
+    , testCase "receiving fields retain order and reject obsolete arity" $ do
+        PlutusTx.fromData @V4.ScriptPurpose (V4.Constr 7 [scriptHashData]) @?= Nothing
+        PlutusTx.fromData @V4.ScriptPurpose (V4.Constr 7 [V4.I 3, scriptHashData]) @?= Nothing
+        PlutusTx.fromData @V4.ScriptInfo (V4.Constr 7 []) @?= Nothing
+        PlutusTx.fromData @V4.ScriptInfo (V4.Constr 7 [outputData, V4.I 3]) @?= Nothing
+    , testCase "identical receiving outputs retain separate purposes and contexts" $ do
+        let protected = output {V4.txOutAddress = V4.AddressProtected (V4.ScriptCredential scriptHash) Nothing}
+            ordinary = output {V4.txOutAddress = V4.Address (V4.ScriptCredential scriptHash) Nothing}
+            info =
+              txInfo
+                { V4.txInfoOutputs = [ordinary, protected, ordinary, protected]
+                , V4.txInfoRedeemers =
+                    AssocMap.unsafeFromList
+                      [(V4.Receiving scriptHash 1, redeemer), (V4.Receiving scriptHash 3, redeemer)]
+                }
+            contexts = [V4.ScriptContext info redeemer (V4.ReceivingScript ix protected) scriptHash | ix <- [1, 3]]
+            backedContexts = map (PlutusTx.unsafeFromBuiltinData @DataV4.ScriptContext . PlutusTx.toBuiltinData) contexts
+        length (AssocMap.toList (V4.txInfoRedeemers info)) @?= 2
+        length (nub (map PlutusTx.toData contexts)) @?= 2
+        map
+          ( \backed -> case DataV4.scriptContextScriptInfo backed of
+              DataV4.ReceivingScript ix resolved -> (ix, PlutusTx.toData resolved)
+              _ -> error "Expected ReceivingScript"
+          )
+          backedContexts
+          @?= [(1, PlutusTx.toData protected), (3, PlutusTx.toData protected)]
+    , testCase "ReceivingScript carries the indexed resolved output" $ do
+        let first = output {V4.txOutDatum = V4.OutputDatum (V4.Datum (PlutusTx.toBuiltinData (2 :: Integer)))}
+            second = output {V4.txOutDatum = V4.OutputDatum (V4.Datum (PlutusTx.toBuiltinData (4 :: Integer)))}
+            info = txInfo {V4.txInfoOutputs = [first, second]}
+            contexts =
+              [ V4.ScriptContext info redeemer (V4.ReceivingScript ix resolved) scriptHash
+              | (ix, resolved) <- [(0, first), (1, second)]
+              ]
+            backedContexts = map (PlutusTx.unsafeFromBuiltinData @DataV4.ScriptContext . PlutusTx.toBuiltinData) contexts
+        map (PlutusTx.toData . DataV4.scriptContextScriptInfo) backedContexts
+          @?= [V4.Constr 7 [V4.I 0, PlutusTx.toData first], V4.Constr 7 [V4.I 1, PlutusTx.toData second]]
     , testCase "time range" $ do
         assertProduct (V4.POSIXTimeRange Nothing Nothing) [nothingData, nothingData]
         PlutusTx.toData (DataV4.POSIXTimeRange Nothing Nothing) @?= V4.List [nothingData, nothingData]
@@ -432,6 +494,17 @@ tests =
         PlutusTx.toData (Ratio.unsafeRatio 1 2) @?= V4.Constr 0 [V4.I 1, V4.I 2]
         PlutusTx.toData (V3.assetClass (V3.CurrencySymbol "currency") (V3.TokenName "token"))
           @?= V4.Constr 0 [V4.B "currency", V4.B "token"]
+    , testCase "address blueprint constructors preserve their assigned indexes" $ do
+        let definitions = deriveDefinitions @'[V4.Address]
+            schemas = definitionsToMap definitions constructorIndexes
+        Map.lookup (definitionId @V4.Address) schemas @?= Just [(0, 2), (1, 2)]
+    , testCase "receiving blueprint constructors carry two fields at index seven" $ do
+        let definitions = deriveDefinitions @'[V4.ScriptPurpose, V4.ScriptInfo]
+            schemas = definitionsToMap definitions constructorIndexes
+        Map.lookup (definitionId @V4.ScriptPurpose) schemas
+          @?= Just [(0, 2), (1, 2), (2, 2), (3, 3), (4, 2), (5, 3), (6, 2), (7, 2)]
+        Map.lookup (definitionId @V4.ScriptInfo) schemas
+          @?= Just [(0, 1), (1, 2), (2, 1), (3, 2), (4, 1), (5, 2), (6, 2), (7, 2)]
     , testCase "product blueprint definitions" $ do
         let definitions = deriveDefinitions @'[V4.ScriptContext, V4.Committee, V4.AssetClass]
             schemas = definitionsToMap definitions isListSchema
@@ -449,7 +522,6 @@ tests =
               , definitionId @V4.TxInfo
               , definitionId @V4.TopTxInfo
               , definitionId @V4.TopTxInfoSimplified
-              , definitionId @V4.Address
               , definitionId @V4.TxOut
               , definitionId @V4.TxInInfo
               , definitionId @V4.POSIXTimeRange
@@ -536,7 +608,7 @@ tests =
     datum = V4.Datum (PlutusTx.dataToBuiltinData datumData)
     address = V4.Address credential (Just account)
     dataAddress = DataV4.Address dataCredential (Just dataAccount)
-    addressData = V4.List [credentialData, justData credentialData]
+    addressData = V4.Constr 0 [credentialData, justData credentialData]
     output = V4.TxOut address value (V4.OutputDatum datum) (Just scriptHash)
     dataOutput = DataV4.TxOut dataAddress dataValue (DataV4.OutputDatum datum) (Just scriptHash)
     outputData = V4.List [addressData, assetMapData 6, V4.Constr 2 [datumData], justData scriptHashData]
@@ -721,3 +793,8 @@ isListSchema _ = False
 definitionIds :: Definitions referencedTypes -> [DefinitionId]
 definitionIds NoDefinitions = []
 definitionIds (AddDefinition (MkDefinition identifier _) rest) = identifier : definitionIds rest
+
+constructorIndexes :: Schema referencedTypes -> [(Integer, Int)]
+constructorIndexes (SchemaOneOf schemas) = concatMap constructorIndexes (NE.toList schemas)
+constructorIndexes (SchemaConstructor _ (MkConstructorSchema tag fields)) = [(toInteger tag, length fields)]
+constructorIndexes _ = []
